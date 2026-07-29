@@ -2,4 +2,4 @@
 
 from importlib.metadata import version
 
-__version__ = version("swell-swot")
+__version__ = version("swot-healpix")
