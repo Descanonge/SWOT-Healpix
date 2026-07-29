@@ -1,0 +1,61 @@
+
+[build-system]
+requires = ['setuptools>=64', 'setuptools-scm>=8']
+build-backend = 'setuptools.build_meta'
+
+[project]
+dynamic = ['version']
+
+name = 'swot-healpix'
+authors = [
+    {name='Clément Haëck', email='clement.haeck@cnrs.fr'}
+]
+description = 'Resample SWOT data on Healpix'
+
+readme = 'README.md'
+requires-python = '>=3.13'
+
+classifiers = []
+dependencies = []
+
+[tool.setuptools_scm]
+[tool.setuptools]
+packages = ['swot_healpix']
+
+[tool.mypy]
+ignore_missing_imports = true
+exclude = []
+
+[tool.ruff]
+line-length = 88
+target-version = 'py311'
+extend-exclude = []
+
+[tool.ruff.lint]
+select = [
+       'E',  # pycodestyle
+       'W',  # pycodestyle
+       'I',  # isort
+       'N',  # pep8-name
+       'B',  # bugbear
+       'G',  # flake8-logging-format
+       'F',  # pyflakes
+       'UP',  #pyupgrade
+       'D',  #pydocstyle
+       'PL', # pylint
+]
+
+ignore = [
+       'E226', # missing whitespace around arithmetic operator
+       'D203', # one blank line before class
+       'D213', # multiline docstring start at 2nd line
+       'D417', # not all parameters need doc
+       'PLR2004', # magic values
+       'PLR0913', # too many arguments
+       'PLC0415', # import not top of the file
+]
+
+unfixable = ["F401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = 'numpy'

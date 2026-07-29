@@ -1,0 +1,49 @@
+name: swot-healpix
+dependencies:
+  - python=3.13
+
+# IPython / Jupyter
+  - jupyterlab
+  - ipython
+  - ipykernel
+  - jupyter_console
+
+# Basic science stack
+  - numpy
+  - scipy
+  - pandas
+  - pytorch
+
+# Visualization stack
+  - matplotlib
+  - cartopy
+  - cmocean
+  - nc-time-axis
+  - tol-colors
+
+# Xarray
+  - xarray
+  - netCDF4
+  - h5netcdf
+  - zarr
+  - cftime
+  - bottleneck
+
+  - dask
+  - python-graphviz
+
+# Linting et al.
+  - ruff
+  - isort
+  - mypy
+  - jedi
+  - pytest
+
+  - pip
+  - pip:
+    - ipython-autoimport
+
+    - healpix-geo
+    - healpix-plot
+    - healpix-resample
+    - healpix-analyse
