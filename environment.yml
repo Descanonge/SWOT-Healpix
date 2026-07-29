@@ -51,3 +51,5 @@ dependencies:
     - healpix-plot
     - healpix-resample
     - healpix-analyse
+
+    - tqdm
