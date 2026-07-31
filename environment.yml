@@ -1,6 +1,9 @@
 name: swot-healpix
+channels:
+  - conda-forge
+  - nodefaults
 dependencies:
-  - python=3.13
+  - python=3.14
 
 # IPython / Jupyter
   - jupyterlab
@@ -33,7 +36,11 @@ dependencies:
   - dask
   - python-graphviz
 
-  - xdggs
+# Object storage
+  - boto3
+  - fsspec
+  - s3fs
+  - zcollection
 
 # Linting et al.
   - ruff
