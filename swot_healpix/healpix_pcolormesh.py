@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import healpix_geo
@@ -8,11 +9,11 @@ import matplotlib.pyplot as plt
 import matplotlib.transforms as mtransforms
 import numpy as np
 from cdshealpix import from_ring, to_ring
+from healpix_plot.healpix import HealpixGrid
 from matplotlib.collections import QuadMesh
 from matplotlib.colorizer import Colorizer
 
 if TYPE_CHECKING:
-    from healpix_plot import EllipsoidLike
     from matplotlib.axes import Axes
     from matplotlib.colors import Colormap, Norm
     from numpy.typing import NDArray
@@ -21,10 +22,8 @@ if TYPE_CHECKING:
 def reindex_ring_to_2d(n_side: int) -> np.ndarray:
     """Return indices to reorder cells from ring order to 2d.
 
-    For Healpix cells arranged in a square (rotated 45°). They can be obtained from a
-    parent cell or from a center cell expanded with `healpix_geo.*.kth_neighborhood`.
-
-    This cannot work if the tile crosses wrapping longitude.
+    This uses the fact that cells in the ring indexing scheme are arranged from left
+    to right and top to bottom.
 
     To use those indices: Be sure to use 'ring' indexing scheme. Sort cells by id:
     ```
@@ -38,11 +37,22 @@ def reindex_ring_to_2d(n_side: int) -> np.ndarray:
     cell_data_2d = np.zeroes((n_side, n_side))
     np.put(cell_data_2d, argsort_ring_to_2d(n_side), cell_data)
     ```
+
+    Example (3x3)
+    -------------
+    Left is ring-order, right is 2D (flattened) order.
+    ```
+        0            0
+      1   2        3   1
+    3   4   5 => 6   4   2
+      6   7        7   5
+        8            8
+    ```
     """
     indices = np.zeros(n_side**2, dtype="i8")
     i_cell_start = 0
     n_cell_ring = 1
-    for i_ring in range(n_side):
+    for _ in range(n_side):
         ix = np.arange(0, n_cell_ring)
         iy = np.arange(n_cell_ring - 1, -1, -1)
         indices[i_cell_start : i_cell_start + n_cell_ring] = iy * n_side + ix
@@ -64,21 +74,105 @@ def reindex_ring_to_2d(n_side: int) -> np.ndarray:
     return indices
 
 
+def _fill_tile(
+    tile_id: np.uint64,
+    tile_cell_ids_partial: NDArray,
+    tile_cell_data_partial: NDArray,
+    level: int,
+    level_tile: int,
+) -> tuple[NDArray, NDArray]:
+    """Fill tile if necessary.
+
+    The parent tile may have missing values (not present in input data). Return 1D array
+    of the tile with missing values as NaNs.
+    """
+    if tile_cell_ids_partial.size == 4 ** (level - level_tile):
+        tile_cell_ids = tile_cell_ids_partial
+        tile_cell_data = tile_cell_data_partial
+    else:
+        # We need to fill missing cells in tile. We need the index of each cell,
+        # relative to the parent tile
+        # Starting id for tile (at fine level)
+        tile_id0 = np.left_shift(tile_id, 2 * (level - level_tile))
+        tile_cell_ids_relative = tile_cell_ids_partial - tile_id0
+
+        tile_cell_ids = np.arange(4 ** (level - level_tile), dtype="u8") + tile_id0
+        tile_cell_data = np.full(4 ** (level - level_tile), np.nan)
+        tile_cell_data[tile_cell_ids_relative] = tile_cell_data_partial
+    return tile_cell_ids, tile_cell_data
+
+
+def _reindex_tile_2d(
+    tile_cell_ids: NDArray,
+    tile_cell_data: NDArray,
+    n_side: int,
+    level: int,
+    ring2d_indices: NDArray,
+) -> tuple[NDArray, NDArray]:
+    """Reindex tile from nested to 2D.
+
+    Convert to ring index, and use pre-computed `ring2d_indices` to reindex.
+    """
+    tile_cell_ids = to_ring(tile_cell_ids, depth=level)
+    sort_indices = np.argsort(tile_cell_ids)
+    tile_cell_ids = tile_cell_ids[sort_indices]
+    tile_cell_data = tile_cell_data[sort_indices]
+
+    tile_cell_data_2d = np.zeros((n_side, n_side))
+    np.put(tile_cell_data_2d, ring2d_indices, tile_cell_data)
+    tile_cell_ids_2d = np.zeros(n_side**2, dtype="u8")
+    np.put(tile_cell_ids_2d, ring2d_indices, tile_cell_ids)
+
+    return tile_cell_ids_2d, tile_cell_data_2d
+
+
+def _compute_grid(
+    tile_cell_ids_2d: NDArray, n_side: int, healpix_grid: HealpixGrid
+) -> tuple[NDArray, NDArray]:
+    """Compute the grid coordinates for pcolormesh.
+
+    Returns
+    -------
+    lon, lat:
+        Coordinates as 2D arrays each of size `(n_side+1, n_side+1)`.
+    """
+    vertices = np.stack(
+        healpix_geo.ring.vertices(
+            tile_cell_ids_2d, depth=healpix_grid.level, ellipsoid=healpix_grid.ellipsoid
+        ),
+        axis=0,
+    )
+    vertices = vertices.reshape(2, n_side, n_side, 4)
+
+    grid = np.zeros((2, n_side + 1, n_side + 1))
+
+    # Top vertex for top-left part of grid
+    grid[:, :-1, :-1] = vertices[:, :, :, 2]
+    # Right vertex for rightmost column
+    grid[:, :-1, -1] = vertices[:, :, -1, 1]
+    # Left vertex for last row
+    grid[:, -1, :-1] = vertices[:, -1, :, 3]
+    # Bottom vertex for bottom-right cell
+    grid[:, -1, -1] = vertices[:, -1, -1, 0]
+
+    return grid[0], grid[1]
+
+
 def _pcolormesh(
     ax: Axes,
     x: NDArray,
     y: NDArray,
     c: NDArray,
-    tile_cell_ids_partial,
     *,
-    level: int,
+    tile_cell_ids_partial,
+    healpix_grid: HealpixGrid,
     colorizer: Colorizer,
     **kwargs,
 ) -> QuadMesh:
     """Pcolormesh that deals with data limits appropriately.
 
     pcolormesh scales the view to fit the data, even if invalid. Because our tiles can
-    contain a lot of invalid data this can create a lot of white space around the data.
+    contain a lot of invalid data this can create a lot of white space.
 
     This functions is a copy of pcolormesh that scales the view correctly.
 
@@ -116,25 +210,28 @@ def _pcolormesh(
 
     # Use partial (ie valid) cells for scaling data view
     tile_xy = np.stack(
-        healpix_geo.nested.healpix_to_lonlat(tile_cell_ids_partial, level), axis=-1
+        healpix_geo.nested.healpix_to_lonlat(
+            tile_cell_ids_partial,
+            depth=healpix_grid.level,
+            ellipsoid=healpix_grid.ellipsoid,
+        ),
+        axis=-1,
     )
-
     minx, miny = np.min(tile_xy, axis=0)
     maxx, maxy = np.max(tile_xy, axis=0)
     collection.sticky_edges.x[:] = [minx, maxx]
     collection.sticky_edges.y[:] = [miny, maxy]
     ax.update_datalim([[minx, miny], [maxx, maxy]])
+
     return collection
 
 
 def healpix_pcolormesh(
     cell_ids: NDArray,
     cell_data: NDArray,
-    level: int,
+    healpix_grid: HealpixGrid | Mapping,
     level_tile: int | None = None,
     *,
-    indexing_scheme: str = "nested",
-    ellipsoid: EllipsoidLike = "sphere",
     vmin: float | None = None,
     vmax: float | None = None,
     cmap: Colormap | str | None = None,
@@ -151,21 +248,14 @@ def healpix_pcolormesh(
     Parameters
     ----------
     cell_ids:
-        The cell ids describing the spatial position of the data. Cells must be indexed
-        as nested (and be sorted in correct order).
-    data:
-        The data to plot. If 1D, will be color-coded using the standard
-        matplotlib mechanisms. If 2D, the last axis must have a size of 3 (for
-        RGB) or 4 (for RGBA).
+        The cell ids describing the spatial position of the data.
+    cell_data:
+        The data to plot as a 1D array.
     healpix_grid:
         Object or dictionnary giving parameters of the input data Healpix grid.
-    level:
-        Healpix level/depth of data.
     level_tile:
         Healpix level/depth of tiles. If left to None, will default to `level - 11`,
         giving tiles of size 2048 x 2048.
-    ellipsoid:
-        Ellipsoid descriptor. Defaults to "sphere".
     vmin, vmax:
         When no explicit norm is passed, `vmin` and `vmax` will be used to define the
         data range that the colormap covers.
@@ -178,6 +268,11 @@ def healpix_pcolormesh(
     kwargs:
         Other arguments passed to `pcolormesh`.
     """
+    if isinstance(healpix_grid, Mapping):
+        healpix_grid = HealpixGrid(**healpix_grid)
+
+    level = healpix_grid.level
+
     if level_tile is None:
         level_tile = max(0, level - 11)
     if level_tile >= level:
@@ -202,9 +297,10 @@ def healpix_pcolormesh(
     n_side = 2 ** (level - level_tile)
     ring2d_indices = reindex_ring_to_2d(n_side)
 
-    if indexing_scheme == "ring":
+    if healpix_grid.indexing_scheme == "ring":
         # Need to reindex and sort by id
         cell_ids = from_ring(cell_ids, level)
+    if not np.all(cell_ids[:-1] < cell_ids[1:]):
         sort_indices = np.argsort(cell_ids)
         cell_ids = cell_ids[sort_indices]
         cell_data = cell_data[sort_indices]
@@ -224,65 +320,23 @@ def healpix_pcolormesh(
         tile_cell_ids_partial = cell_ids[tile_indices[i_tile]]
         tile_cell_data_partial = cell_data[tile_indices[i_tile]]
 
-        if tile_cell_ids_partial.size == 4 ** (level - level_tile):
-            tile_cell_ids = tile_cell_ids_partial
-            tile_cell_data = tile_cell_data_partial
-        else:
-            # We need to fill missing cells in tile. We need the index of each cell,
-            # relative to the parent tile
-            # Starting id for tile (at fine level)
-            tile_id0 = np.left_shift(tile_id, 2 * (level - level_tile))
-            tile_cell_ids_relative = tile_cell_ids_partial - tile_id0
-
-            tile_cell_ids = np.arange(4 ** (level - level_tile), dtype="u8") + tile_id0
-            tile_cell_data = np.full(4 ** (level - level_tile), np.nan)
-            tile_cell_data[tile_cell_ids_relative] = tile_cell_data_partial
-
-        # Reindex tile in 2d. This is fairly easy to do from a ring-scheme id.
-        tile_cell_ids = to_ring(tile_cell_ids, depth=level)
-        sort_indices = np.argsort(tile_cell_ids)
-        tile_cell_ids = tile_cell_ids[sort_indices]
-        tile_cell_data = tile_cell_data[sort_indices]
-
-        tile_data_2d = np.zeros((n_side, n_side))
-        np.put(tile_data_2d, ring2d_indices, tile_cell_data)
-        tile_cell_ids_2d = np.zeros(n_side**2, dtype="u8")
-        np.put(tile_cell_ids_2d, ring2d_indices, tile_cell_ids)
-
-        # Get cell coordinates. We need to a grid of side N+1
-        # (to get the rightmost edge)
-        vertices = np.stack(
-            healpix_geo.ring.vertices(
-                tile_cell_ids_2d, depth=level, ellipsoid=ellipsoid
-            ),
-            axis=-1,
+        tile_cell_ids, tile_cell_data = _fill_tile(
+            tile_id, tile_cell_ids_partial, tile_cell_data_partial, level, level_tile
         )
-        vertices = vertices.reshape(n_side, n_side, 4, 2)
+        tile_cell_ids_2d, tile_cell_data_2d = _reindex_tile_2d(
+            tile_cell_ids, tile_cell_data, n_side, level, ring2d_indices
+        )
 
-        # Start with top vertex (of the healpix diamond cell)
-        grid = vertices[:, :, 2]
-        # Add rightmost column (right vertex)
-        grid = np.concatenate([grid, vertices[:, [-1], 1]], axis=1)
-        # Take last line (left vertex)
-        last_line = vertices[-1, :, 3]
-        # Add rightmost colum to last line (bottom vertex)
-        last_line = np.concatenate([last_line, vertices[-1, [-1], 0]], axis=0)
-        # Add last line
-        grid = np.concatenate([grid, last_line[None, :]], axis=0)
-        x = grid[..., 0]
-        y = grid[..., 1]
+        x, y = _compute_grid(tile_cell_ids_2d, n_side, healpix_grid)
 
-        # quadmeshes.append(
-        #     ax.pcolormesh(x, y, tile_data_2d, colorizer=colorizer, **kwargs)
-        # )
         quadmeshes.append(
             _pcolormesh(
                 ax,
                 x,
                 y,
-                tile_data_2d,
-                tile_cell_ids_partial,
-                level=level,
+                tile_cell_data_2d,
+                tile_cell_ids_partial=tile_cell_ids_partial,
+                healpix_grid=healpix_grid,
                 colorizer=colorizer,
                 **kwargs,
             )
