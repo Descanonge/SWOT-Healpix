@@ -8,7 +8,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.transforms as mtransforms
 import numpy as np
-from cdshealpix import from_ring, to_ring
+from cdshealpix import from_ring
 from healpix_plot.healpix import HealpixGrid
 from matplotlib.collections import QuadMesh
 from matplotlib.colorizer import Colorizer
@@ -19,13 +19,14 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-def reindex_ring_to_2d(n_side: int) -> np.ndarray:
+def reindex_ring_to_2d(level: int) -> np.ndarray:
     """Return indices to reorder cells from ring order to 2d.
 
     This uses the fact that cells in the ring indexing scheme are arranged from left
     to right and top to bottom.
 
-    To use those indices: Be sure to use 'ring' indexing scheme. Sort cells by id:
+    To use those indices: Be sure to use 'ring' indexing scheme and that cells are
+    sorted by id:
     ```
     cell_ids = to_ring(cell_ids, depth=level)
     sort_indices = np.argsort(cell_ids)
@@ -34,21 +35,24 @@ def reindex_ring_to_2d(n_side: int) -> np.ndarray:
     ```
     Then to wrap data into a 2d array:
     ```
-    cell_data_2d = np.zeroes((n_side, n_side))
-    np.put(cell_data_2d, argsort_ring_to_2d(n_side), cell_data)
+    cell_data_2d = np.zeros((2**level, 2**level))
+    np.put(cell_data_2d, reindex_ring_to_2d(level), cell_data)
     ```
 
-    Example (3x3)
-    -------------
+    Example (level 2)
+    -----------------
     Left is ring-order, right is 2D (flattened) order.
     ```
-        0            0
-      1   2        3   1
-    3   4   5 => 6   4   2
-      6   7        7   5
-        8            8
+              0                        15
+           1     2                  14    11
+        3     4     5            13    10     7
+     6     7     8     9  =>  12     9     6     3
+       10    11    12             8     5     2
+          13    14                   4     1
+             15                         0
     ```
     """
+    n_side = 2**level
     indices = np.zeros(n_side**2, dtype="i8")
     i_cell_start = 0
     n_cell_ring = 1
@@ -72,6 +76,54 @@ def reindex_ring_to_2d(n_side: int) -> np.ndarray:
 
     indices = np.asarray(indices)
     return indices
+
+
+def reindex_nested_to_2d(level: int) -> NDArray:
+    """Return indices to reorder cells from nested order to 2d.
+
+    To use those indices: Be sure to use 'nested' indexing scheme and that cells are
+    sorted by id:
+    ```
+    cell_ids = from_ring(cell_ids, depth=level)
+    sort_indices = np.argsort(cell_ids)
+    cell_ids = cell_ids[sort_indices]
+    cell_data = cell_data[sort_indices]
+    ```
+    Then to wrap data into a 2d array:
+    ```
+    cell_data_2d = np.zeroes((2**level, 2**level))
+    cell_data_2d[reindex_nested_to_2d(level)] = cell_data
+    ```
+
+    Example (level 2)
+    -----------------
+    Left is nested-order, right is 2D (flattened) order.
+    ```
+              15                        15
+           14    13                  14    11
+        11    12     7            13    10     7
+     10     9     6     5  =>  12     9     6     3
+         8     3     4             8     5     2
+            2     1                   4     1
+               0                         0
+    ```
+    """
+    n_side = 2**level
+    cell_ids = np.arange(n_side**2)
+
+    # When considering nested indexing:
+    # - 0 (bottom cell): shift by 0
+    # - 1 (right cell): shift by 1 cell
+    # - 2 (left cell): shift by 1 row
+    # - 3 (top cell): shift by 1 row + 1 cell
+    shift = np.array([0, 1, n_side, n_side + 1])
+
+    reindex = np.zeros(n_side**2, dtype="i8")
+    for i_level in range(level):
+        reindex += 2**i_level * shift[cell_ids % 4]
+        cell_ids = np.right_shift(cell_ids, 2)
+
+    return reindex
 
 
 def _fill_tile(
@@ -106,22 +158,13 @@ def _reindex_tile_2d(
     tile_cell_ids: NDArray,
     tile_cell_data: NDArray,
     n_side: int,
-    level: int,
-    ring2d_indices: NDArray,
+    nested2d_indices: NDArray,
 ) -> tuple[NDArray, NDArray]:
-    """Reindex tile from nested to 2D.
-
-    Convert to ring index, and use pre-computed `ring2d_indices` to reindex.
-    """
-    tile_cell_ids = to_ring(tile_cell_ids, depth=level)
-    sort_indices = np.argsort(tile_cell_ids)
-    tile_cell_ids = tile_cell_ids[sort_indices]
-    tile_cell_data = tile_cell_data[sort_indices]
-
+    """Reindex tile from nested to 2D."""
     tile_cell_data_2d = np.zeros((n_side, n_side))
-    np.put(tile_cell_data_2d, ring2d_indices, tile_cell_data)
-    tile_cell_ids_2d = np.zeros(n_side**2, dtype="u8")
-    np.put(tile_cell_ids_2d, ring2d_indices, tile_cell_ids)
+    np.put(tile_cell_data_2d, nested2d_indices, tile_cell_data)
+    tile_cell_ids_2d = np.zeros((n_side, n_side), dtype="u8")
+    np.put(tile_cell_ids_2d, nested2d_indices, tile_cell_ids)
 
     return tile_cell_ids_2d, tile_cell_data_2d
 
@@ -137,23 +180,23 @@ def _compute_grid(
         Coordinates as 2D arrays each of size `(n_side+1, n_side+1)`.
     """
     vertices = np.stack(
-        healpix_geo.ring.vertices(
+        healpix_geo.nested.vertices(
             tile_cell_ids_2d, depth=healpix_grid.level, ellipsoid=healpix_grid.ellipsoid
         ),
         axis=0,
     )
-    vertices = vertices.reshape(2, n_side, n_side, 4)
 
     grid = np.zeros((2, n_side + 1, n_side + 1))
 
-    # Top vertex for top-left part of grid
-    grid[:, :-1, :-1] = vertices[:, :, :, 2]
-    # Right vertex for rightmost column
+    # Grid "top" is towards north-west, x is fast index.
+    # Bottom vertex for bottom-right part of grid
+    grid[:, :-1, :-1] = vertices[:, :, :, 0]
+    # Right vertex for last column
     grid[:, :-1, -1] = vertices[:, :, -1, 1]
-    # Left vertex for last row
+    # Left vertex for top row
     grid[:, -1, :-1] = vertices[:, -1, :, 3]
-    # Bottom vertex for bottom-right cell
-    grid[:, -1, -1] = vertices[:, -1, -1, 0]
+    # Top vertex for top-right cell
+    grid[:, -1, -1] = vertices[:, -1, -1, 2]
 
     return grid[0], grid[1]
 
@@ -280,6 +323,9 @@ def healpix_pcolormesh(
             f"Tile level ({level_tile}) should be coarser than data level ({level})"
         )
 
+    # Size of tiles
+    n_side = 2 ** (level - level_tile)
+
     if ax is None:
         ax = plt.gca()
 
@@ -293,9 +339,9 @@ def healpix_pcolormesh(
         c_vmax = vmax if vmax is not None else np.max(cell_data)
     colorizer.set_clim(c_vmin, c_vmax)
 
-    # Build indices to reindex a tile from ring scheme to 2d
+    # Build indices to reindex a tile from nested scheme to 2d
     n_side = 2 ** (level - level_tile)
-    ring2d_indices = reindex_ring_to_2d(n_side)
+    nested2d_indices = reindex_nested_to_2d(level - level_tile)
 
     if healpix_grid.indexing_scheme == "ring":
         # Need to reindex and sort by id
@@ -324,7 +370,7 @@ def healpix_pcolormesh(
             tile_id, tile_cell_ids_partial, tile_cell_data_partial, level, level_tile
         )
         tile_cell_ids_2d, tile_cell_data_2d = _reindex_tile_2d(
-            tile_cell_ids, tile_cell_data, n_side, level, ring2d_indices
+            tile_cell_ids, tile_cell_data, n_side, nested2d_indices
         )
 
         x, y = _compute_grid(tile_cell_ids_2d, n_side, healpix_grid)
