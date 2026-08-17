@@ -1,50 +1,228 @@
-"""Compute spectra from a SWOT trace."""
+"""Compute spectra."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.signal.windows import tukey
+
+
+def fft_2d(a: NDArray, window: NDArray) -> NDArray:
+    """Compute 2D FFT of array with hanning window."""
+    a = a - np.mean(a)
+    a = a * window
+
+    fft = np.fft.fft2(a, norm="forward")
+    fft = np.fft.fftshift(fft)
+    return fft
+
+
+def average_psd_azimuth(
+    psd: NDArray, fx: NDArray, fy: NDArray
+) -> tuple[NDArray, NDArray]:
+    """Average azimuthally a 2D PSD to obtain an isotropic 1D power spectra.
+
+    Parameters
+    ----------
+    psd:
+        The 2D PSD. Array of dimensions [y, x].
+    fx, fy:
+        The frequencies in x and y directions.
+
+    Returns
+    -------
+    freqs:
+        Array of 1D frequencies.
+    psd:
+        1D power spectra.
+    """
+    ny, nx = psd.shape
+    fx2d, fy2d = np.meshgrid(fx, fy, indexing="xy")
+    fr = np.sqrt(fx2d**2 + fy2d**2)  # radial spatial frequency (cycles per unit length)
+
+    # Radial binning
+    nbins = min(nx, ny) // 2
+    f_bins = np.linspace(0.0, fr.max(), nbins + 1)
+
+    # Vectorized bin average of P2D over annuli
+    fr_flat = fr.ravel()
+    psd_flat = psd.ravel()
+    bin_idx = np.digitize(fr_flat, f_bins) - 1  # -> [0, nbins-1]
+    valid = (bin_idx >= 0) & (bin_idx < nbins)
+
+    # Sum and count per bin, then mean
+    sum_per_bin = np.bincount(bin_idx[valid], weights=psd_flat[valid], minlength=nbins)
+    cnt_per_bin = np.bincount(bin_idx[valid], minlength=nbins)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        psd_k = sum_per_bin / cnt_per_bin
+    psd_k[cnt_per_bin == 0] = np.nan  # empty bins
+
+    # Bin centers
+    f_centers = 0.5 * (f_bins[1:] + f_bins[:-1])
+
+    return f_centers, psd_k / (nx * ny)
 
 
 @dataclass
-class SpectraSpecs:
-    """Container for spectra-related variables."""
+class PSD2:
+    """Container for cross-PSD of 2 arrays."""
 
-    dx: int = 250
-    """Cross-track resolution in meters."""
-    dy: int = 235
-    """Along-track resolution in meters."""
-    # Those are approximations, these are not true constants
+    psd_a: NDArray
+    """PSD of the first array"""
+    psd_b: NDArray
+    """PSD of the second array"""
+    phase: NDArray
+    """Cross-spectra phase"""
 
-    n_spectral_x: int = 20
-    """Number of cross-track spectral points."""
-    n_spectral_y: int = 21
-    """Number of along-track spectral points."""
+    def __post_init__(self):
+        self.angle = np.angle(self.phase)
+        """Cross-spectra angle."""
+        self.cross = np.real(self.phase)
+        """Cross-spectra (real part)."""
+        self.coherence = np.abs(self.phase**2) / (self.psd_a * self.psd_b)
+        """Spectral coherence between SSHA and backscatter."""
 
-    # Box of size 40km x 40km, one per swath
-    box_size_x: int = 160
-    """Box size in pixels in cross-track direction."""
-    box_size_y: int = 168
-    """Box size in pixels in along-track direction."""
-    box_increment_y: int = 168
 
-    box_nadir_side_x: int = 20
-    """Index of the box side closer to nadir, in cross-track direction."""
+@dataclass
+class FFTComputer:
+    """Parameters of box moving along the swath."""
 
-    # Tiles of size 5km x 5km, with 50% overlap
-    tile_size_x: int = 20
-    """Cross-track tile size for Welch's method."""
-    tile_size_y: int = 21
-    """Along-track tile size for Welch's method."""
+    box_size_x: int
+    """Box size in pixels."""
+    box_size_y: int
+    """Box size in pixels."""
 
-    tile_increment_x: int = 10
-    """Increment between tiles in cross-track, 50% overlap."""
-    tile_increment_y: int = 10
-    """Increment between tiles in along-track, 50% overlap."""
+    dx: float
+    """Resolution in meters."""
+    dy: float
+    """Resolution in meters."""
 
-    def get_box_indices_y(self, n_lines: int):
-        """Return indices of boxes (lower-left corner) in along-track direction."""
-        return np.arange(0, n_lines - self.box_size_y, self.box_increment_y)
+    @property
+    def n_spectral_x(self) -> int:
+        """Number of frequencies."""
+        return self.box_size_x
+
+    @property
+    def n_spectral_y(self) -> int:
+        """Number of frequencies."""
+        return self.box_size_y
+
+    def get_frequencies(self) -> tuple[NDArray, NDArray]:
+        """Return frequencies for directions x and y (in that order)."""
+        fx = np.fft.fftshift(np.fft.fftfreq(self.n_spectral_x, self.dx))
+        fy = np.fft.fftshift(np.fft.fftfreq(self.n_spectral_y, self.dy))
+        return fx, fy
+
+    def get_apodizing_window(
+        self,
+        kind: Literal["tukey", "hanning"] = "hanning",
+        **kwargs,
+    ) -> tuple[NDArray, float]:
+        """Compute apodizing window.
+
+        Parameters
+        ----------
+        kind:
+            Either 'tukey' or 'hanning'.
+        kwargs:
+            Passed to the function creating the 1D apodizing window.
+
+        Returns
+        -------
+        window:
+            2D apodizing window.
+        normalization:
+            Window correction factor.
+        """
+        if kind == "tukey":
+            win_x = tukey(self.n_spectral_x, **kwargs)
+            win_y = tukey(self.n_spectral_y, **kwargs)
+        elif kind == "hanning":
+            win_x = np.hanning(self.n_spectral_x, **kwargs)
+            win_y = np.hanning(self.n_spectral_y, **kwargs)
+
+        win = win_x[None, :] * win_y[:, None]
+
+        # Window correction factors
+        dk_x = 1 / (self.dx * self.n_spectral_x)
+        dk_y = 1 / (self.dy * self.n_spectral_y)
+        win_correction_x = 1 / np.mean(win_x**2)
+        win_correction_y = 1 / np.mean(win_y**2)
+        normalization = (win_correction_x * win_correction_y) / (dk_x * dk_y)
+
+        return win, normalization
+
+    def asdict(self) -> dict[str, Any]:
+        """Return self as a dictionnary."""
+        return asdict(self)
+
+    def psd(self, box: NDArray) -> NDArray:
+        """Compute 2D PSD."""
+        window, normalization = self.get_apodizing_window("hanning")
+        fft = fft_2d(box, window)
+        psd = np.abs(fft) ** 2 * normalization
+        return psd
+
+    def cross_psd(self, a: NDArray, b: np.ndarray) -> PSD2:
+        """Compute PSD of two 2D array (with cross-correlation).
+
+        Parameters
+        ----------
+        a:
+            First array to FFT. Must be of dimensions (y, x), north-up and east-right.
+        b:
+            Second array to FFT. Must be of same dimensions and orientation as `a`.
+
+        Returns
+        -------
+        psd2:
+            PSD object containing spectras and other results.
+        """
+        assert a.shape == (self.box_size_y, self.box_size_x)
+        assert b.shape == (self.box_size_y, self.box_size_x)
+
+        window, normalization = self.get_apodizing_window("hanning")
+
+        fft_a = fft_2d(a, window)
+        fft_b = fft_2d(b, window)
+
+        psd_a = np.abs(fft_a) ** 2 * normalization
+        psd_b = np.abs(fft_b) ** 2 * normalization
+        phase = fft_b * np.conj(fft_a) * normalization
+
+        psd2 = PSD2(psd_a, psd_b, phase)
+
+        return psd2
+
+
+@dataclass
+class FFTWelchComputer(FFTComputer):
+    """Compute power-spectra using Welch's method."""
+
+    tile_size_x: int
+    """Tile size in pixels."""
+    tile_size_y: int
+    """Tile size in pixels."""
+
+    tile_increment_x: int
+    """Shift of tile in pixels."""
+    tile_increment_y: int
+    """Shift of tile in pixels."""
+
+    @property
+    def n_spectral_x(self) -> int:
+        """Number of frequencies."""
+        return self.tile_size_x
+
+    @property
+    def n_spectral_y(self) -> int:
+        """Number of frequencies."""
+        return self.tile_size_y
+
+    @property
+    def _spectra_shape(self) -> tuple[int, int]:
+        return (self.n_spectral_y, self.n_spectral_x)
 
     def get_tile_indices_x(self) -> NDArray:
         """Return indices of tiles in cross-track direction."""
@@ -58,159 +236,77 @@ class SpectraSpecs:
             0, self.box_size_y - self.tile_size_y + 1, self.tile_increment_y
         )
 
-    def get_frequencies(self) -> tuple[NDArray, NDArray]:
-        """Return frequencies.
+    def psd(self, box: NDArray) -> NDArray:
+        """Compute FFT for a box."""
+        assert box.shape == (self.box_size_y, self.box_size_x)
+
+        tile_indices_x = self.get_tile_indices_x()
+        tile_indices_y = self.get_tile_indices_y()
+        n_tile_x = len(tile_indices_x)
+        n_tile_y = len(tile_indices_y)
+
+        window, normalization = self.get_apodizing_window("hanning")
+
+        # Initialize mean PSD
+        psd = np.zeros(self._spectra_shape)
+
+        for i_tile_y in tile_indices_y:
+            slice_y = slice(i_tile_y, i_tile_y + self.tile_size_y)
+            for i_tile_x in tile_indices_x:
+                slice_x = slice(i_tile_x, i_tile_x + self.tile_size_x)
+                tile_fft = fft_2d(box[slice_y, slice_x], window)
+                psd[:, :] = psd[:, :] + np.abs(tile_fft) ** 2 * normalization
+
+        psd = psd / (n_tile_x * n_tile_y)
+
+        return psd
+
+    def cross_psd(self, a: NDArray, b: np.ndarray) -> PSD2:
+        """Compute PSD of two 2D array (with cross-correlation).
+
+        Parameters
+        ----------
+        a:
+            First array to FFT. Must be of dimensions (y, x), north-up and east-right.
+        b:
+            Second array to FFT. Must be of same dimensions and orientation as `a`.
 
         Returns
         -------
-        fx, fy:
-            Spectral frequencies, centered around zero.
+        psd2:
+            PSD object containing spectras and other results.
         """
-        fx = np.fft.fftshift(np.fft.fftfreq(self.tile_size_x, self.dx))
-        fy = np.fft.fftshift(np.fft.fftfreq(self.tile_size_y, self.dy))
-        return fx, fy
+        assert a.shape == (self.box_size_y, self.box_size_x)
+        assert b.shape == (self.box_size_y, self.box_size_x)
 
-    def get_attrs(self) -> dict:
-        """Return specs as a dictionary for Dataset attributes."""
-        return {attr: getattr(self, attr) for attr in self.__dataclass_fields__.keys()}
+        tile_indices_x = self.get_tile_indices_x()
+        tile_indices_y = self.get_tile_indices_y()
+        n_tile_x = len(tile_indices_x)
+        n_tile_y = len(tile_indices_y)
 
+        window, normalization = self.get_apodizing_window("hanning")
 
-class PSD2:
-    """Container for PSD of 2 arrays."""
+        # Initialize mean PSD
+        psd_a = np.zeros(self._spectra_shape)
+        psd_b = np.zeros(self._spectra_shape)
+        phase = np.zeros(self._spectra_shape, dtype=complex)
 
-    def __init__(self, psd_a: NDArray, psd_b: NDArray, phase: NDArray, n_tiles: int):
-        self.psd_a = psd_a / n_tiles
-        """PSD of the first array"""
-        self.psd_b = psd_b / n_tiles
-        """PSD of the second array"""
+        for i_tile_y in tile_indices_y:
+            slice_y = slice(i_tile_y, i_tile_y + self.tile_size_y)
+            for i_tile_x in tile_indices_x:
+                slice_x = slice(i_tile_x, i_tile_x + self.tile_size_x)
 
-        self.n_tiles = n_tiles
-        """Number of valid tiles used."""
+                a_tile_fft = fft_2d(a[slice_y, slice_x], window)
+                b_tile_fft = fft_2d(b[slice_y, slice_x], window)
 
-        self.phase = phase / n_tiles
-        """Cross-spectra phase"""
-        self.angle = np.angle(phase)
-        """Cross-spectra angle."""
-        self.cross = np.real(phase) / n_tiles
-        """Cross-spectra (real part)."""
-        self.coherence = np.abs(self.phase**2) / (self.psd_a * self.psd_b)
-        """Spectral coherence between SSHA and backscatter."""
+                psd_a[:, :] += np.abs(a_tile_fft) ** 2 * normalization
+                psd_b[:, :] += np.abs(b_tile_fft) ** 2 * normalization
+                phase[:, :] += b_tile_fft * np.conj(a_tile_fft) * normalization
+        n_tiles = n_tile_x * n_tile_y
+        psd_a /= n_tiles
+        psd_b /= n_tiles
+        phase /= n_tiles
 
+        psd2 = PSD2(psd_a, psd_b, phase)
 
-def fft_tile(box: NDArray, hanning: NDArray, slice_x: slice, slice_y: slice) -> NDArray:
-    """Compute FFT for a single tile."""
-    tile = box[slice_y, slice_x]
-    tile = tile - np.mean(tile)
-    tile = tile * hanning
-
-    fft = np.fft.fft2(tile, norm="forward")
-    fft = np.fft.fftshift(fft)
-    return fft
-
-
-def psd_2d(a: NDArray, specs: SpectraSpecs):
-    """Compute PSD of a single 2D array.
-
-    Parameters
-    ----------
-    a:
-        Array to FFT. Must be of dimensions (y, x), north-up and east-right.
-
-    Returns
-    -------
-    psd:
-        Array of PSD.
-    """
-    assert a.shape == (specs.box_size_y, specs.box_size_x)
-
-    tile_indices_x = specs.get_tile_indices_x()
-    tile_indices_y = specs.get_tile_indices_y()
-    n_tile_x = len(tile_indices_x)
-    n_tile_y = len(tile_indices_y)
-
-    # Wavenumber resolution
-    dk_x = 1 / (specs.dx * specs.tile_size_x)
-    dk_y = 1 / (specs.dy * specs.tile_size_y)
-
-    # Hanning windows
-    hanning_x = np.hanning(specs.tile_size_x)
-    hanning_y = np.hanning(specs.tile_size_y)
-    hanning = hanning_x[None, :] * hanning_y[:, None]
-    # Window correction factors
-    window_correction_x = 1 / np.mean(hanning_x**2)
-    window_correction_y = 1 / np.mean(hanning_y**2)
-    normalization = (window_correction_x * window_correction_y) / (dk_x * dk_y)
-
-    # Initialize mean PSD
-    psd = np.zeros((specs.tile_size_y, specs.tile_size_x))
-
-    for i_tile_y in tile_indices_y:
-        slice_y = slice(i_tile_y, i_tile_y + specs.tile_size_y)
-        for i_tile_x in tile_indices_x:
-            slice_x = slice(i_tile_x, i_tile_x + specs.tile_size_x)
-            tile_fft = fft_tile(a, hanning, slice_x, slice_y)
-            psd[:, :] = psd[:, :] + np.abs(tile_fft) ** 2 * normalization
-
-    psd = psd / (n_tile_x * n_tile_y)
-
-    return psd
-
-
-def cross_psd_2d(a: NDArray, b: np.ndarray, specs: SpectraSpecs) -> PSD2:
-    """Compute PSD of two 2D array (with cross-correlation).
-
-    Parameters
-    ----------
-    a:
-        First array to FFT. Must be of dimensions (y, x), north-up and east-right.
-    b:
-        Second array to FFT. Must be of same dimensions and orientation as `a`.
-
-    Returns
-    -------
-    psd2:
-        PSD object containing spectras and other results.
-    """
-    assert a.shape == (specs.box_size_y, specs.box_size_x)
-    assert b.shape == (specs.box_size_y, specs.box_size_x)
-
-    tile_indices_x = specs.get_tile_indices_x()
-    tile_indices_y = specs.get_tile_indices_y()
-    n_tile_x = len(tile_indices_x)
-    n_tile_y = len(tile_indices_y)
-
-    # Wavenumber resolution
-    dk_x = 1 / (specs.dx * specs.tile_size_x)
-    dk_y = 1 / (specs.dy * specs.tile_size_y)
-
-    # Hanning windows
-    hanning_x = np.hanning(specs.tile_size_x)
-    hanning_y = np.hanning(specs.tile_size_y)
-    hanning = hanning_x[None, :] * hanning_y[:, None]
-    # Window correction factors
-    window_correction_x = 1 / np.mean(hanning_x**2)
-    window_correction_y = 1 / np.mean(hanning_y**2)
-    normalization = (window_correction_x * window_correction_y) / (dk_x * dk_y)
-
-    # Initialize mean PSD
-    spectra_shape = (specs.tile_size_y, specs.tile_size_x)
-    psd_a = np.zeros(spectra_shape)
-    psd_b = np.zeros(spectra_shape)
-    phase = np.zeros(spectra_shape, dtype=complex)
-
-    for i_tile_y in tile_indices_y:
-        slice_y = slice(i_tile_y, i_tile_y + specs.tile_size_y)
-        for i_tile_x in tile_indices_x:
-            slice_x = slice(i_tile_x, i_tile_x + specs.tile_size_x)
-
-            a_tile_fft = fft_tile(a, hanning, slice_x, slice_y)
-            b_tile_fft = fft_tile(b, hanning, slice_x, slice_y)
-
-            psd_a[:, :] += np.abs(a_tile_fft) ** 2 * normalization
-            psd_b[:, :] += np.abs(b_tile_fft) ** 2 * normalization
-            phase[:, :] += b_tile_fft * np.conj(a_tile_fft) * normalization
-
-    # the PSD2 object will do the normalization by n_tiles
-    psd2 = PSD2(psd_a, psd_b, phase, n_tiles=n_tile_x * n_tile_y)
-
-    return psd2
+        return psd2

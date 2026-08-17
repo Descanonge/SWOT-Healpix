@@ -10,7 +10,7 @@ import logging
 import numpy as np
 import xarray as xr
 
-from swot_healpix.analysis.spectra import SpectraSpecs, psd_2d
+from swot_healpix.analysis.spectra import FFTComputer, FFTWelchComputer
 from swot_healpix.data import SWOT, check_target
 
 log = logging.getLogger(__name__)
@@ -25,24 +25,34 @@ except ImportError:
 
 
 def compute_spectra_swath(
-    specs: SpectraSpecs, swot: xr.Dataset, side: str
+    swot: xr.Dataset, side: str, fft_computer: FFTComputer
 ) -> xr.Dataset:
     """Compute the spectra for one swath.
 
     Parameters
     ----------
-    specs:
-        Set of variables.
     swot:
         Dataset of L2 SWOT data.
     side:
         "left" or "right" swath.
+    moving_box:
+        Allow to select boxes along swath.
+    welch:
+        Compute PSD inside boxes.
     """
-    box_indices_y = specs.get_box_indices_y(swot.num_lines.size)
+    box_increment_y = fft_computer.box_size_y
+    box_nadir_side_x = 20
+    """Index of the box side closer to nadir, in cross-track direction."""
+
+    box_indices_y = np.arange(
+        0, swot.num_lines.size - fft_computer.box_size_y, box_increment_y
+    )
     n_box = len(box_indices_y)
 
     # Initialize
-    box_psd_ssh = np.zeros((n_box, specs.tile_size_y, specs.tile_size_x))
+    box_psd_ssh = np.zeros(
+        (n_box, fft_computer.n_spectral_y, fft_computer.n_spectral_x)
+    )
     box_extent = np.zeros((n_box, 4), dtype=int)
     box_lon = np.zeros(n_box)
     box_lat = np.zeros(n_box)
@@ -54,9 +64,9 @@ def compute_spectra_swath(
         main_loop = tqdm(main_loop, total=len(box_indices_y))
     for i_box, i_box_y in main_loop:
         box = swot.isel(
-            num_lines=slice(i_box_y, i_box_y + specs.box_size_y),
+            num_lines=slice(i_box_y, i_box_y + fft_computer.box_size_y),
             num_pixels=slice(
-                specs.box_nadir_side_x, specs.box_nadir_side_x + specs.box_size_x
+                box_nadir_side_x, box_nadir_side_x + fft_computer.box_size_x
             ),
         )
 
@@ -67,25 +77,25 @@ def compute_spectra_swath(
         if track.pass_type == "descending":
             box = box.isel(num_lines=slice(None, None, -1))
 
-        box_psd_ssh[i_box] = psd_2d(box.ssh_karin_2.values, specs)
+        box_psd_ssh[i_box] = fft_computer.psd(box.ssh_karin_2.values)
 
         box_extent[i_box, :] = [
-            specs.box_nadir_side_x,
+            box_nadir_side_x,
             i_box_y,
-            specs.box_nadir_side_x + specs.box_size_x,
-            i_box_y + specs.box_size_y,
+            box_nadir_side_x + fft_computer.box_size_x,
+            i_box_y + fft_computer.box_size_y,
         ]
 
         # Center position
-        box_lon[i_box] = box.longitude.isel(
-            num_lines=specs.box_size_y // 2, num_pixels=specs.box_size_x // 2
-        ).values
-        box_lat[i_box] = box.latitude.isel(
-            num_lines=specs.box_size_y // 2, num_pixels=specs.box_size_x // 2
-        ).values
-        box_time[i_box] = box.time.isel(num_lines=specs.box_size_y // 2).values
+        center = dict(
+            num_lines=fft_computer.box_size_y // 2,
+            num_pixels=fft_computer.box_size_x // 2,
+        )
+        box_lon[i_box] = box.longitude.isel(**center).values
+        box_lat[i_box] = box.latitude.isel(**center).values
+        box_time[i_box] = box.time.isel(num_lines=center["num_lines"]).values
 
-    fx, fy = specs.get_frequencies()
+    fx, fy = fft_computer.get_frequencies()
 
     psd_ds = xr.Dataset(
         {
@@ -101,7 +111,7 @@ def compute_spectra_swath(
             "fx": fx,
             "fy": fy,
         },
-        attrs=specs.get_attrs(),
+        attrs=fft_computer.asdict(),
     )
 
     psd_ds.psd_ssh.attrs.update(
@@ -124,7 +134,20 @@ def compute_spectra_swath(
 
 if __name__ == "__main__":
     track = SWOT(cycle=546, track=19, version="PGC0")
-    specs = SpectraSpecs()
+
+    # x is cross-track, y is along-track
+    # Boxes of size 40x40km, with no overlap
+    # Tiles of size 5x5km, overlap 50%
+    fft_computer = FFTWelchComputer(
+        box_size_x=160,
+        box_size_y=168,
+        dx=250,
+        dy=235,
+        tile_size_x=20,
+        tile_size_y=21,
+        tile_increment_x=10,
+        tile_increment_y=10,
+    )
 
     # Find corresponding SWOT file
     swot_file = track.get_file()
@@ -135,9 +158,9 @@ if __name__ == "__main__":
     swot = xr.open_datatree(swot_file)
 
     log.info("Computing PSD for left swat")
-    psd_l = compute_spectra_swath(specs, swot.left, "left")
+    psd_l = compute_spectra_swath(swot.left, "left", fft_computer)
     log.info("Computing PSD for right swat")
-    psd_r = compute_spectra_swath(specs, swot.right, "right")
+    psd_r = compute_spectra_swath(swot.right, "right", fft_computer)
 
     psd_l = psd_l.assign_coords({"box": psd_l.box * 2})
     psd_r = psd_r.assign_coords({"box": psd_r.box * 2 + 1})

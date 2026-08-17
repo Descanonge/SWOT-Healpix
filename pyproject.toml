@@ -50,6 +50,7 @@ ignore = [
        'D203', # one blank line before class
        'D213', # multiline docstring start at 2nd line
        'D417', # not all parameters need doc
+       'D105', # no docstring for magic method
        'PLR2004', # magic values
        'PLR0913', # too many arguments
        'PLC0415', # import not top of the file
