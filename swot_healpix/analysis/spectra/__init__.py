@@ -84,7 +84,7 @@ class PSD2:
         """Spectral coherence between SSHA and backscatter."""
 
 
-@dataclass
+@dataclass(kw_only=True)
 class FFTComputer:
     """Parameters of box moving along the swath."""
 
@@ -97,6 +97,8 @@ class FFTComputer:
     """Resolution in meters."""
     dy: float
     """Resolution in meters."""
+
+    apodizing_kind: Literal["tukey", "hanning"] = "hanning"
 
     @property
     def n_spectral_x(self) -> int:
@@ -116,7 +118,7 @@ class FFTComputer:
 
     def get_apodizing_window(
         self,
-        kind: Literal["tukey", "hanning"] = "hanning",
+        kind: Literal["tukey", "hanning"] | None = None,
         **kwargs,
     ) -> tuple[NDArray, float]:
         """Compute apodizing window.
@@ -124,7 +126,8 @@ class FFTComputer:
         Parameters
         ----------
         kind:
-            Either 'tukey' or 'hanning'.
+            Either 'tukey' or 'hanning'. If None, defaults to attribute
+            :attr:`apodizing_kind`.
         kwargs:
             Passed to the function creating the 1D apodizing window.
 
@@ -135,12 +138,16 @@ class FFTComputer:
         normalization:
             Window correction factor.
         """
+        if kind is None:
+            kind = self.apodizing_kind
         if kind == "tukey":
             win_x = tukey(self.n_spectral_x, **kwargs)
             win_y = tukey(self.n_spectral_y, **kwargs)
         elif kind == "hanning":
             win_x = np.hanning(self.n_spectral_x, **kwargs)
             win_y = np.hanning(self.n_spectral_y, **kwargs)
+        else:
+            raise KeyError(f"Unsupported apodizing window kind '{kind}'")
 
         win = win_x[None, :] * win_y[:, None]
 
@@ -196,7 +203,7 @@ class FFTComputer:
         return psd2
 
 
-@dataclass
+@dataclass(kw_only=True)
 class FFTWelchComputer(FFTComputer):
     """Compute power-spectra using Welch's method."""
 
