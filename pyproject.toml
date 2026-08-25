@@ -28,7 +28,7 @@ exclude = []
 
 [tool.ruff]
 line-length = 88
-target-version = 'py311'
+target-version = 'py314'
 extend-exclude = []
 
 [tool.ruff.lint]
@@ -64,6 +64,7 @@ unfixable = ["F401"]
            "B905",
            "D100",
            "I001",
+           "E402",
 ]
 
 [tool.ruff.lint.pydocstyle]
