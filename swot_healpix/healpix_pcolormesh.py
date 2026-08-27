@@ -7,16 +7,14 @@ from typing import TYPE_CHECKING
 
 import cartopy.crs as ccrs
 import healpix_geo
-import matplotlib as mpl
 import matplotlib.pyplot as plt
-import matplotlib.transforms as mtransforms
 import numpy as np
 from cartopy.mpl.geoaxes import GeoAxes
 from cdshealpix import from_ring
 from healpix_plot.healpix import HealpixGrid
 from matplotlib.collections import QuadMesh
 from matplotlib.colorizer import Colorizer
-from matplotlib.colors import Normalize
+from matplotlib.colors import Norm
 from matplotlib.transforms import Bbox
 
 if TYPE_CHECKING:
@@ -45,31 +43,42 @@ def _extract_tile(
 
 def _fill_tile(
     tile_id: np.uint64,
-    tile_cell_ids_partial: NDArray,
-    tile_cell_data_partial: NDArray,
+    cell_ids_partial: NDArray,
+    cell_colors_partial: NDArray,
     level: int,
     level_tile: int,
 ) -> tuple[NDArray, NDArray]:
     """Fill tile if necessary.
 
-    The parent tile may have missing values (not present in input data). Return 1D array
-    of the tile with missing values as NaNs.
+    The parent tile may have missing values (not present in input data). Return RGBA
+    array with transparent values for missing cells.
     """
     n_cells = 4 ** (level - level_tile)
-    if tile_cell_ids_partial.size == n_cells:
-        tile_cell_ids = tile_cell_ids_partial
-        tile_cell_data = tile_cell_data_partial
-    else:
-        # We need to fill missing cells in tile. We need the index of each cell,
-        # relative to the parent tile
-        # Starting id for tile (at fine level)
-        tile_id0 = np.left_shift(tile_id, 2 * (level - level_tile))
-        tile_cell_ids_relative = tile_cell_ids_partial - tile_id0
+    if cell_ids_partial.shape[0] == n_cells:
+        return cell_ids_partial, cell_colors_partial
 
-        tile_cell_ids = np.arange(n_cells, dtype=tile_cell_ids_partial.dtype) + tile_id0
-        tile_cell_data = np.full(n_cells, np.nan, dtype=tile_cell_data_partial.dtype)
-        tile_cell_data[tile_cell_ids_relative] = tile_cell_data_partial
-    return tile_cell_ids, tile_cell_data
+    # We need to fill missing cells in tile. We need the index of each cell,
+    # relative to the parent tile
+    # Starting id for tile (at fine level)
+    tile_id0 = np.left_shift(tile_id, 2 * (level - level_tile))
+    ids_relative = cell_ids_partial - tile_id0
+    ids = np.arange(n_cells, dtype=cell_ids_partial.dtype) + tile_id0
+
+    color_dtype = cell_colors_partial.dtype
+    # If only RGB, add alpha channel
+    if cell_colors_partial.shape[1] == 3:
+        cell_colors_partial = np.hstack(
+            [
+                cell_colors_partial,
+                np.ones([cell_colors_partial.shape[0], 1], dtype=color_dtype),
+            ]
+        )
+
+    colors = np.ones((n_cells, cell_colors_partial.shape[1]), dtype=color_dtype)
+    colors[:, 3] = 0
+    colors[ids_relative] = cell_colors_partial
+
+    return ids, colors
 
 
 def _build_2d_indices(size: int) -> NDArray:
@@ -86,21 +95,26 @@ def _build_2d_indices(size: int) -> NDArray:
 
 
 def _reindex_tile_2d(
-    tile_cell_ids: NDArray,
-    tile_cell_data: NDArray,
+    cell_ids: NDArray,
+    cell_colors: NDArray,
     n_side: int,
     nested2d_indices: NDArray,
 ) -> tuple[NDArray, NDArray]:
     """Reindex tile from nested to 2D."""
-    tile_cell_data_2d = np.zeros((n_side, n_side), dtype=tile_cell_data.dtype)
-    np.put(tile_cell_data_2d, nested2d_indices, tile_cell_data)
-    tile_cell_ids_2d = np.zeros((n_side, n_side), dtype="u8")
-    np.put(tile_cell_ids_2d, nested2d_indices, tile_cell_ids)
+    n_rgb = cell_colors.shape[1]
+    cell_colors_2d = np.zeros((n_side * n_side, n_rgb), dtype=cell_colors.dtype)
+    cell_colors_2d[nested2d_indices] = cell_colors
+    cell_colors_2d = cell_colors_2d.reshape((n_side, n_side, n_rgb))
 
-    return tile_cell_ids_2d, tile_cell_data_2d
+    cell_ids_2d = np.zeros(n_side * n_side, dtype="u8")
+    cell_ids_2d[nested2d_indices] = cell_ids
+    cell_ids_2d = cell_ids_2d.reshape((n_side, n_side))
+
+    return cell_ids_2d, cell_colors_2d
 
 
 def wrap_longitude(lon: NDArray, base_cell: int) -> NDArray:
+    """Map longitude to [-180, 180]."""
     lon = (lon + 180) % 360 - 180
     if base_cell in [1, 9]:
         lon[lon == -180] = 180
@@ -108,7 +122,7 @@ def wrap_longitude(lon: NDArray, base_cell: int) -> NDArray:
 
 
 def _compute_grid(
-    tile_cell_ids_2d: NDArray, n_side: int, healpix_grid: HealpixGrid
+    cell_ids_2d: NDArray, n_side: int, healpix_grid: HealpixGrid
 ) -> tuple[NDArray, NDArray]:
     """Compute the grid coordinates for pcolormesh.
 
@@ -119,7 +133,7 @@ def _compute_grid(
     """
     vertices = np.stack(
         healpix_geo.nested.vertices(
-            tile_cell_ids_2d, depth=healpix_grid.level, ellipsoid=healpix_grid.ellipsoid
+            cell_ids_2d, depth=healpix_grid.level, ellipsoid=healpix_grid.ellipsoid
         ),
         axis=0,
     )
@@ -140,9 +154,7 @@ def _compute_grid(
     # Map longitude to [-180, 180]
     # lon = wrap_longitude(lon)
 
-    base_cell = healpix_geo.nested.zoom_to(
-        tile_cell_ids_2d[0, 0], healpix_grid.level, 0
-    )
+    base_cell = healpix_geo.nested.zoom_to(cell_ids_2d[0, 0], healpix_grid.level, 0)
     if base_cell != 6:
         lon = wrap_longitude(lon, base_cell)
 
@@ -151,7 +163,6 @@ def _compute_grid(
 
 def find_extent(cell_ids: NDArray, healpix_grid: HealpixGrid) -> Bbox:
     """Find extend of given cells."""
-    # Use partial (ie valid) cells for scaling data view
     lon, lat = np.stack(
         healpix_geo.nested.healpix_to_lonlat(
             cell_ids,
@@ -186,65 +197,6 @@ def find_extent(cell_ids: NDArray, healpix_grid: HealpixGrid) -> Bbox:
     )
 
 
-def _pcolormesh(
-    ax: Axes,
-    x: NDArray,
-    y: NDArray,
-    c: NDArray,
-    /,
-    *,
-    extent: tuple[float, float, float, float],
-    healpix_grid: HealpixGrid,
-    colorizer: Colorizer,
-    **kwargs,
-) -> QuadMesh:
-    """Pcolormesh that deals with data limits appropriately.
-
-    pcolormesh scales the view to fit the data, even if invalid. Because our tiles can
-    contain a lot of invalid data this can create a lot of white space.
-
-    This functions is a copy of pcolormesh that scales the view correctly.
-
-    Since we supply a Colorizer, no need for some norm-related code.
-    """
-    shading = kwargs.pop("shading", None)
-    shading = mpl._val_or_rc(shading, "pcolor.shading").lower()  # type: ignore[attr-defined]
-    kwargs.setdefault("edgecolors", "none")
-    kwargs.setdefault("antialiased", None)
-
-    X, Y, C, shading = ax._pcolorargs(  # type: ignore[attr-defined]
-        "pcolormesh", x, y, c, shading=shading, kwargs=kwargs
-    )
-    coords = np.stack([X, Y], axis=-1)
-
-    kwargs.setdefault("snap", mpl.rcParams["pcolormesh.snap"])
-
-    collection = QuadMesh(
-        coords,
-        array=C,
-        colorizer=colorizer,
-        shading=shading,
-        **kwargs,
-    )
-
-    t = collection._transform  # type: ignore[attr-defined]
-    if not isinstance(t, mtransforms.Transform) and hasattr(t, "_as_mpl_transform"):
-        t = t._as_mpl_transform(ax.axes)
-
-    if t and any(t.contains_branch_separately(ax.transData)):
-        trans_to_data = t - ax.transData
-        coords = trans_to_data.transform(coords)
-
-    xmin, xmax, ymin, ymax = extent
-    ax.update_datalim([[xmin, ymin], [xmax, ymax]])
-    collection.sticky_edges.x[:] = [xmin, xmax]
-    collection.sticky_edges.y[:] = [ymin, ymax]
-
-    ax.add_collection(collection, autolim=False)
-
-    return collection
-
-
 def _to_nested_sorted(
     cell_ids: NDArray, cell_data: NDArray, healpix_grid: HealpixGrid
 ) -> tuple[NDArray, NDArray]:
@@ -269,7 +221,8 @@ def healpix_pcolormesh(
     vmin: float | None = None,
     vmax: float | None = None,
     cmap: Colormap | str | None = None,
-    norm: Normalize | str | None = None,
+    norm: Norm | str | None = None,
+    colorizer: Colorizer | None = None,
     ax: Axes | None = None,
     **kwargs,
 ) -> list[QuadMesh]:
@@ -284,7 +237,10 @@ def healpix_pcolormesh(
     cell_ids:
         The cell ids describing the spatial position of the data.
     cell_data:
-        The data to plot as a 1D array.
+        The data to plot with shapes:
+        - (N): Scalar data mapped to colors
+        - (N, 3): RGB values (0-1 float)
+        - (N, 4): RGBA values (0-1 float)
     healpix_grid:
         Object or dictionnary giving parameters of the input data Healpix grid.
     level_tile:
@@ -299,6 +255,11 @@ def healpix_pcolormesh(
     norm:
         Normalization method used to scale data to the [0, 1] range before mapping to
         colors. See documentation of :func:`~matplotlib.pyplot.pcolormesh` for details.
+    colorizer:
+        The Colorizer object used to map color to data. If None, a Colorizer object is
+        created from a norm and cmap.
+    ax:
+        Axes instance to plot onto. Cartopy :class:`.GeoAxes` are supported.
     kwargs:
         Other arguments passed to `pcolormesh`.
     """
@@ -306,7 +267,6 @@ def healpix_pcolormesh(
         healpix_grid = HealpixGrid(**healpix_grid)
 
     level = healpix_grid.level
-
     if level_tile is None:
         level_tile = max(0, level - 11)
     if level_tile >= level:
@@ -316,33 +276,37 @@ def healpix_pcolormesh(
 
     if ax is None:
         ax = plt.gca()
-
-    # We need to ensure vmin is set (either via kwargs or via the norm) otherwise
-    # each tile would have a different range
-    if isinstance(norm, Normalize):
-        if norm.vmin is None:
-            norm.vmin = np.min(cell_data)
-        if norm.vmax is None:
-            norm.vmax = np.max(cell_data)
-    else:
-        if vmin is None:
-            vmin = np.min(cell_data)
-        if vmax is None:
-            vmax = np.max(cell_data)
-
     if isinstance(ax, GeoAxes):
         kwargs.setdefault("transform", ccrs.PlateCarree())
+
+    if cell_data.ndim == 1:
+        # We need to ensure vmin is set (either via kwargs or via the norm) otherwise
+        # each tile would have a different range
+        if colorizer is None:
+            colorizer = Colorizer(cmap=cmap, norm=norm)
+        c_vmin, c_vmax = colorizer.get_clim()
+        if c_vmin is None:
+            c_vmin = vmin if vmin is not None else np.min(cell_data)
+        if c_vmax is None:
+            c_vmax = vmax if vmax is not None else np.max(cell_data)
+        colorizer.set_clim(c_vmin, c_vmax)
+        cmap = colorizer.cmap
+        norm = colorizer.norm
+
+        cell_data = colorizer.to_rgba(cell_data)
+    elif cell_data.shape[1] not in [3, 4]:
+        raise IndexError(f"Invalid shape for data {cell_data.shape}")
+
+    # We do some indexing work that will fail if dtypes are mismatched
+    if cell_ids.dtype.kind == "i":
+        cell_ids = cell_ids.astype("u8")
+
+    cell_ids, cell_data = _to_nested_sorted(cell_ids, cell_data, healpix_grid)
 
     # Size of tiles
     n_side = 2 ** (level - level_tile)
     # Build indices to reindex a tile from nested scheme to 2d
     nested2d_indices = _build_2d_indices(level - level_tile)
-
-    cell_ids, cell_data = _to_nested_sorted(cell_ids, cell_data, healpix_grid)
-
-    # We do some indexing work that will fail if dtypes are mismatched
-    if cell_ids.dtype.kind == "i":
-        cell_ids = cell_ids.astype("u8")
 
     # Find the parent tile and the indices to select each tile from data
     tile_ids, tile_splits = _find_tiles(cell_ids, level, level_tile)
@@ -366,18 +330,10 @@ def healpix_pcolormesh(
         # This will be changed by pcolormesh, save it
         ignore_existing_data_limits = ax.ignore_existing_data_limits
 
-        quadmesh = ax.pcolormesh(
-            x,
-            y,
-            tile_cell_data_2d,
-            vmin=vmin,
-            vmax=vmax,
-            norm=norm,
-            cmap=cmap,
-            **kwargs,
-        )
+        quadmesh = ax.pcolormesh(x, y, tile_cell_data_2d, **kwargs)
+        quadmesh.set(cmap=cmap, norm=norm, **kwargs)
 
-        if tile_cell_ids_partial.size < tile_cell_ids.size:
+        if tile_cell_ids_partial.shape[0] < tile_cell_ids.size:
             any_partial = True
             tile_extent = find_extent(tile_cell_ids_partial, healpix_grid)
             ax_extent.update_from_data_xy(
