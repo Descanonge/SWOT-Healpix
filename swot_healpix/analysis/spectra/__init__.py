@@ -5,15 +5,15 @@ from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal.windows import tukey
+from scipy.signal.windows import hann, tukey
 
 
-def fft_2d(a: NDArray, window: NDArray) -> NDArray:
+def fft_2d(a: NDArray, window: NDArray, norm: str = "ortho") -> NDArray:
     """Compute 2D FFT of array with hanning window."""
     a = a - np.mean(a)
     a = a * window
 
-    fft = np.fft.fft2(a, norm="forward")
+    fft = np.fft.fft2(a, norm=norm)  # type: ignore[call-overload]
     fft = np.fft.fftshift(fft)
     return fft
 
@@ -75,7 +75,7 @@ class PSD2:
     phase: NDArray
     """Cross-spectra phase"""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.angle = np.angle(self.phase)
         """Cross-spectra angle."""
         self.cross = np.real(self.phase)
@@ -119,7 +119,9 @@ class FFTComputer:
     def get_apodizing_window(
         self,
         kind: Literal["tukey", "hanning"] | None = None,
-        **kwargs,
+        *,
+        sym: bool = True,
+        **kwargs: Any,
     ) -> tuple[NDArray, float]:
         """Compute apodizing window.
 
@@ -141,11 +143,11 @@ class FFTComputer:
         if kind is None:
             kind = self.apodizing_kind
         if kind == "tukey":
-            win_x = tukey(self.n_spectral_x, **kwargs)
-            win_y = tukey(self.n_spectral_y, **kwargs)
+            win_x = tukey(self.n_spectral_x, sym=sym, **kwargs)
+            win_y = tukey(self.n_spectral_y, sym=sym, **kwargs)
         elif kind == "hanning":
-            win_x = np.hanning(self.n_spectral_x, **kwargs)
-            win_y = np.hanning(self.n_spectral_y, **kwargs)
+            win_x = hann(self.n_spectral_x, sym=sym, **kwargs)
+            win_y = hann(self.n_spectral_y, sym=sym, **kwargs)
         else:
             raise KeyError(f"Unsupported apodizing window kind '{kind}'")
 
@@ -164,10 +166,10 @@ class FFTComputer:
         """Return self as a dictionnary."""
         return asdict(self)
 
-    def psd(self, box: NDArray) -> NDArray:
+    def psd(self, box: NDArray, norm: str = "ortho") -> NDArray:
         """Compute 2D PSD."""
         window, normalization = self.get_apodizing_window("hanning")
-        fft = fft_2d(box, window)
+        fft = fft_2d(box, window, norm=norm)
         psd = np.abs(fft) ** 2 * normalization
         return psd
 
@@ -243,7 +245,7 @@ class FFTWelchComputer(FFTComputer):
             0, self.box_size_y - self.tile_size_y + 1, self.tile_increment_y
         )
 
-    def psd(self, box: NDArray) -> NDArray:
+    def psd(self, box: NDArray, norm: str = "ortho") -> NDArray:
         """Compute FFT for a box."""
         assert box.shape == (self.box_size_y, self.box_size_x)
 
@@ -261,7 +263,7 @@ class FFTWelchComputer(FFTComputer):
             slice_y = slice(i_tile_y, i_tile_y + self.tile_size_y)
             for i_tile_x in tile_indices_x:
                 slice_x = slice(i_tile_x, i_tile_x + self.tile_size_x)
-                tile_fft = fft_2d(box[slice_y, slice_x], window)
+                tile_fft = fft_2d(box[slice_y, slice_x], window, norm=norm)
                 psd[:, :] = psd[:, :] + np.abs(tile_fft) ** 2 * normalization
 
         psd = psd / (n_tile_x * n_tile_y)

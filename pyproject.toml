@@ -32,21 +32,49 @@ target-version = 'py314'
 extend-exclude = []
 
 [tool.ruff.lint]
-select = [
-       'E',  # pycodestyle
-       'W',  # pycodestyle
-       'I',  # isort
-       'N',  # pep8-name
-       'B',  # bugbear
-       'G',  # flake8-logging-format
-       'F',  # pyflakes
-       'UP',  #pyupgrade
-       'D',  #pydocstyle
-       'PL', # pylint
+# extend-select = [
+#        'E',  # pycodestyle
+#        'W',  # pycodestyle
+#        'I',  # isort
+#        'N',  # pep8-name
+#        'B',  # bugbear
+#        'G',  # flake8-logging-format
+#        'ARG', # flak
+#        'F',  # pyflakes
+#        'UP',  #pyupgrade
+#        'D',  #pydocstyle
+#        'PL', # pylint
+# ]
+extend-select = [
+    'ANN',  # flake8-annotations
+    'FBT',  # flake8-boolean-trap
+    'B',    # flake8-bugbear
+    'A',    # flake8-builtins
+    'C4',   # flake8-comprehensions
+    'FIX',  # flake8-fixme
+    'ISC',  # flake8-implicit-str-concat
+    'PIE',  # flake8-pie
+    'Q',    # flake8-quotes
+    # 'RET',  # flake8-return
+    'SIM',  # flake8-simplify
+    'ARG',  # flake8-unused-arguments
+    'PTH',  # flake8-use-pathlib
+
+    'I',    # isort
+    'N',    # pep8-naming
+    'E',    # pycodestyle Error
+    'W',    # pycodestyle Warning
+    'DOC',  # pydoclint
+    'D',    # pydocstyle
+    'F',    # Pyflakes
+    'PL',   # Pylint
+    'UP',   # pyupgrade
+    'RUF',  # ruff
 ]
 
 ignore = [
        'E226', # missing whitespace around arithmetic operator
+       'ANN401', # allow Any types
        'D203', # one blank line before class
        'D213', # multiline docstring start at 2nd line
        'D417', # not all parameters need doc
